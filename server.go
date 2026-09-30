@@ -23,14 +23,18 @@ type Server struct {
 
 func (s *Server) authWrap(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		t0 := time.Now()
 		if s.cfg.APIKey != "" {
 			auth := r.Header.Get("Authorization")
 			if auth != "Bearer "+s.cfg.APIKey {
+				logInfo("%s %s -> 401 (bad api key) from %s", r.Method, r.URL.Path, r.RemoteAddr)
 				http.Error(w, `{"error":{"message":"invalid api key","type":"auth_error"}}`, http.StatusUnauthorized)
 				return
 			}
 		}
+		logInfo("REQ %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 		next(w, r)
+		logInfo("DONE %s %s in %.1fs", r.Method, r.URL.Path, time.Since(t0).Seconds())
 	}
 }
 
@@ -380,12 +384,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
+		logInfo("UPSTREAM ERROR %s: %v", req.Model, err)
 		http.Error(w, `{"error":{"message":"upstream: `+err.Error()+`"}}`, http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		logInfo("UPSTREAM %d for model %s: %s", resp.StatusCode, req.Model, string(b)[:min(300, len(b))])
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"upstream %d: %s","type":"upstream_error"}}`,
 			resp.StatusCode, strings.ReplaceAll(string(b), `"`, `\"`)), http.StatusBadGateway)
 		return

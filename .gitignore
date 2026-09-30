@@ -5,3 +5,4 @@ tokens.json
 recon/tokens.json
 *.log
 .DS_Store
+logs/
