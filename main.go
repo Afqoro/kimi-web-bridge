@@ -84,11 +84,69 @@ func NewTokenStore(path string) (*TokenStore, error) {
 
 func (s *TokenStore) Get() (string, bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.Access == "" || time.Now().After(s.expAt.Add(-90*time.Second)) {
-		return "", false
+	if s.Access != "" && time.Now().Before(s.expAt.Add(-90*time.Second)) {
+		s.mu.RUnlock()
+		return s.Access, true
 	}
-	return s.Access, true
+	s.mu.RUnlock()
+	// expired — try auto-refresh
+	s.RefreshNow()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Access != "" && time.Now().Before(s.expAt.Add(-5*time.Second)) {
+		return s.Access, true
+	}
+	return "", false
+}
+
+// RefreshNow calls auth.kimi.ai RefreshToken with the stored refresh_token.
+func (s *TokenStore) RefreshNow() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Refresh == "" {
+		return fmt.Errorf("no refresh token")
+	}
+	body, _ := json.Marshal(map[string]string{"refresh_token": s.Refresh})
+	req, err := http.NewRequest(http.MethodPost, "https://auth.kimi.ai/api/account.gateway.v1.AuthService/RefreshToken",
+		bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("origin", "https://www.kimi.ai")
+	req.Header.Set("referer", "https://www.kimi.ai/")
+	req.Header.Set("user-agent", UAChrome)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("refresh: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("refresh HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var out struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("refresh decode: %w", err)
+	}
+	if out.AccessToken == "" {
+		return fmt.Errorf("refresh: empty accessToken")
+	}
+	s.Access = out.AccessToken
+	if e := jwtExp(out.AccessToken); !e.IsZero() {
+		s.expAt = e
+	}
+	if out.RefreshToken != "" {
+		s.Refresh = out.RefreshToken
+	}
+	out2, _ := json.Marshal(map[string]any{"at": s.Access, "rt": s.Refresh, "fetched_at": time.Now().Unix()})
+	_ = os.WriteFile(s.path, out2, 0o600)
+	logInfo("token auto-refreshed (exp %s)", s.expAt.Format(time.RFC3339))
+	return nil
 }
 
 func (s *TokenStore) Update(access string) {
