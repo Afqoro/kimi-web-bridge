@@ -44,6 +44,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	models := []map[string]any{
 		{"id": "kimi-k2", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k3-low", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k3-high", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k3-max", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3-swarm", "object": "model", "owned_by": "kimi-web"},
 	}
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
@@ -57,7 +60,7 @@ func modelKey(name, def string) string {
 			return def
 		}
 		return DefaultModel
-	case "kimi-k3", "k3":
+	case "kimi-k3", "k3", "kimi-k3-low", "kimi-k3-high", "kimi-k3-max":
 		return "k3"
 	case "kimi-k3-swarm", "k3-agent-ultra":
 		return "k3-agent-ultra"
@@ -104,9 +107,10 @@ func readConnFrames(r io.Reader) ([]connFrame, error) {
 // ---- chat request types ----
 
 type oaiRequest struct {
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
-	Messages []struct {
+	Model           string `json:"model"`
+	Stream          bool   `json:"stream"`
+	ReasoningEffort string `json:"reasoning_effort"`
+	Messages        []struct {
 		Role       string          `json:"role"`
 		Content    json.RawMessage `json:"content"`
 		ToolCalls  json.RawMessage `json:"tool_calls"`
@@ -234,12 +238,24 @@ func toolSeedPrompt(msgs []struct {
 }
 
 // kimiChatRequest is the inner connect JSON payload
-func buildKimiChat(text, model string) map[string]any {
+func buildKimiChat(text, model, effort string) map[string]any {
 	scenario := "SCENARIO_CHAT"
 	kimiPlusID := ""
 	if strings.HasPrefix(model, "k3") {
 		scenario = "SCENARIO_OK_COMPUTER"
 		kimiPlusID = "ok-computer"
+	}
+
+	effortVal := "REASONING_EFFORT_LOW"
+	switch strings.ToLower(effort) {
+	case "high", "medium":
+		effortVal = "REASONING_EFFORT_HIGH"
+	case "max", "ultra":
+		effortVal = "REASONING_EFFORT_MAX"
+	case "none", "off":
+		effortVal = "REASONING_EFFORT_NONE"
+	case "low":
+		effortVal = "REASONING_EFFORT_LOW"
 	}
 
 	return map[string]any{
@@ -254,7 +270,7 @@ func buildKimiChat(text, model string) map[string]any {
 		"options": map[string]any{
 			"thinking":         true,
 			"enable_plugin":    false,
-			"reasoning_effort": "REASONING_EFFORT_LOW",
+			"reasoning_effort": effortVal,
 			"model":            model,
 		},
 		"project_id":   "",
@@ -268,12 +284,12 @@ func buildKimiChatMulti(msgs []struct {
 	Content    json.RawMessage `json:"content"`
 	ToolCalls  json.RawMessage `json:"tool_calls"`
 	ToolCallID string          `json:"tool_call_id"`
-}, model string, tools json.RawMessage) (string, map[string]any) {
+}, model, effort string, tools json.RawMessage) (string, map[string]any) {
 	prompt := toolSeedPrompt(msgs, tools)
 	if os.Getenv("KIMI_WEB_DEBUG") != "" {
 		_ = os.WriteFile("/tmp/kimi-last-prompt.txt", []byte(prompt), 0o600)
 	}
-	return prompt, buildKimiChat(prompt, model)
+	return prompt, buildKimiChat(prompt, model, effort)
 }
 
 // ---- stream event parsing ----
@@ -282,7 +298,18 @@ type kimiEvent struct {
 	Op          string `json:"op"`
 	Mask        string `json:"mask"`
 	EventOffset int64  `json:"eventOffset"`
-	Chat        *struct {
+	Error       *struct {
+		Code    string `json:"code"`
+		Details []struct {
+			Debug struct {
+				Reason           string `json:"reason"`
+				LocalizedMessage struct {
+					Message string `json:"message"`
+				} `json:"localizedMessage"`
+			} `json:"debug"`
+		} `json:"details"`
+	} `json:"error"`
+	Chat *struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"chat"`
@@ -376,7 +403,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, inner := buildKimiChatMulti(req.Messages, modelKey(req.Model, s.cfg.DefaultModel), req.Tools)
+	effort := req.ReasoningEffort
+	if strings.HasSuffix(req.Model, "-high") {
+		effort = "high"
+	} else if strings.HasSuffix(req.Model, "-max") || strings.HasSuffix(req.Model, "-ultra") {
+		effort = "max"
+	} else if strings.HasSuffix(req.Model, "-low") {
+		effort = "low"
+	}
+
+	prompt, inner := buildKimiChatMulti(req.Messages, modelKey(req.Model, s.cfg.DefaultModel), effort, req.Tools)
 	_ = prompt
 	innerB, _ := json.Marshal(inner)
 	env := make([]byte, 5+len(innerB))
@@ -454,7 +490,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			var ev kimiEvent
-			if json.Unmarshal(f.Data, &ev) != nil || ev.Block == nil {
+			if json.Unmarshal(f.Data, &ev) != nil {
+				continue
+			}
+
+			if ev.Error != nil {
+				errMsg := ev.Error.Code
+				if len(ev.Error.Details) > 0 && ev.Error.Details[0].Debug.LocalizedMessage.Message != "" {
+					errMsg = ev.Error.Details[0].Debug.LocalizedMessage.Message
+				}
+				logInfo("UPSTREAM ERROR EVENT: %s", errMsg)
+				sendChunk(map[string]any{"content": "\n\n[Kimi Error: " + errMsg + "]"}, nil)
+				break
+			}
+
+			if ev.Block == nil {
 				continue
 			}
 
