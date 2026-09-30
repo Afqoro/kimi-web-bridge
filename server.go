@@ -73,23 +73,31 @@ type connFrame struct {
 	Data []byte
 }
 
+func readNextConnFrame(br *bufio.Reader) (connFrame, error) {
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(br, hdr); err != nil {
+		return connFrame{}, err
+	}
+	ln := binary.BigEndian.Uint32(hdr[1:5])
+	data := make([]byte, ln)
+	if _, err := io.ReadFull(br, data); err != nil {
+		return connFrame{}, err
+	}
+	return connFrame{Flag: hdr[0], Data: data}, nil
+}
+
 func readConnFrames(r io.Reader) ([]connFrame, error) {
 	var frames []connFrame
 	br := bufio.NewReader(r)
 	for {
-		hdr := make([]byte, 5)
-		if _, err := io.ReadFull(br, hdr); err != nil {
+		f, err := readNextConnFrame(br)
+		if err != nil {
 			if err == io.EOF {
 				return frames, nil
 			}
 			return frames, err
 		}
-		ln := binary.BigEndian.Uint32(hdr[1:5])
-		data := make([]byte, ln)
-		if _, err := io.ReadFull(br, data); err != nil {
-			return frames, err
-		}
-		frames = append(frames, connFrame{Flag: hdr[0], Data: data})
+		frames = append(frames, f)
 	}
 }
 
@@ -406,60 +414,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Collect all frames (server buffers full event stream, then emits OpenAI SSE)
-	frames, err := readConnFrames(resp.Body)
-	if err != nil {
-		http.Error(w, `{"error":{"message":"stream read: `+err.Error()+`"}}`, http.StatusBadGateway)
-		return
-	}
-
-	var thinkBuf, textBuf strings.Builder
-	var msgID, chatID string
-	for _, f := range frames {
-		var ev kimiEvent
-		if json.Unmarshal(f.Data, &ev) != nil {
-			continue
-		}
-		if ev.Chat != nil && ev.Chat.ID != "" {
-			chatID = ev.Chat.ID
-		}
-		_ = chatID
-		if ev.Message != nil {
-			if ev.Message.Role == "assistant" {
-				msgID = ev.Message.ID
-			}
-		}
-		if ev.Block == nil {
-			continue
-		}
-		switch ev.Mask {
-		case "block.think":
-			if ev.Block.Think != nil {
-				thinkBuf.WriteString(ev.Block.Think.Content)
-			}
-		case "block.think.content":
-			if ev.Block.Think != nil {
-				thinkBuf.WriteString(ev.Block.Think.Content)
-			}
-		case "block.text":
-			if ev.Block.Text != nil {
-				textBuf.WriteString(ev.Block.Text.Content)
-			}
-		case "block.text.content":
-			if ev.Block.Text != nil {
-				textBuf.WriteString(ev.Block.Text.Content)
-			}
-		}
-	}
-
-	clean, toolCalls := splitSentinels(textBuf.String())
-	finish := "stop"
-	if len(toolCalls) > 0 {
-		finish = "tool_calls"
-	}
-
-	logInfo("GENERATED for %s: text_len=%d tools=%d think_len=%d", req.Model, len(clean), len(toolCalls), thinkBuf.Len())
-	_ = os.WriteFile("/tmp/kimi-last-raw.txt", []byte(textBuf.String()), 0o644)
+	br := bufio.NewReader(resp.Body)
 
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -470,7 +425,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		sendChunk := func(delta map[string]any, finishReason *string) {
 			chunk := map[string]any{
-				"id":      "chatcmpl-kimiweb-" + msgID,
+				"id":      "chatcmpl-kimiweb-" + fmt.Sprintf("%d", time.Now().UnixMilli()),
 				"object":  "chat.completion.chunk",
 				"created": time.Now().Unix(),
 				"model":   req.Model,
@@ -487,34 +442,98 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 1. Initial role
+		// 1. Initial role chunk segera terkirim (TTFB instan < 100ms)
 		sendChunk(map[string]any{"role": "assistant"}, nil)
 
-		// 2. Reasoning (if any)
-		if think := thinkBuf.String(); think != "" {
-			sendChunk(map[string]any{"reasoning_content": think}, nil)
+		var textBuf strings.Builder
+		var thinkCount int
+
+		for {
+			f, err := readNextConnFrame(br)
+			if err != nil {
+				break
+			}
+			var ev kimiEvent
+			if json.Unmarshal(f.Data, &ev) != nil || ev.Block == nil {
+				continue
+			}
+
+			switch ev.Mask {
+			case "block.think", "block.think.content":
+				if ev.Block.Think != nil && ev.Block.Think.Content != "" {
+					thinkCount++
+					sendChunk(map[string]any{"reasoning_content": ev.Block.Think.Content}, nil)
+				}
+			case "block.text", "block.text.content":
+				if ev.Block.Text != nil && ev.Block.Text.Content != "" {
+					textBuf.WriteString(ev.Block.Text.Content)
+				}
+			}
 		}
 
-		// 3. Content (if any)
+		clean, toolCalls := splitSentinels(textBuf.String())
+		logInfo("GENERATED for %s: text_len=%d tools=%d think_events=%d", req.Model, len(clean), len(toolCalls), thinkCount)
+		_ = os.WriteFile("/tmp/kimi-last-raw.txt", []byte(textBuf.String()), 0o644)
+
 		if clean != "" {
 			sendChunk(map[string]any{"content": clean}, nil)
 		}
-
-		// 4. Tool calls (if any)
 		if len(toolCalls) > 0 {
 			sendChunk(map[string]any{"tool_calls": toolCalls}, nil)
 		}
 
-		// 5. Final finish reason
+		finish := "stop"
+		if len(toolCalls) > 0 {
+			finish = "tool_calls"
+		}
 		sendChunk(map[string]any{}, &finish)
-
-		// 6. DONE sentinel
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		if ok {
 			flusher.Flush()
 		}
 		return
 	}
+
+	// Non-streaming fallback
+	frames, err := readConnFrames(br)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"stream read: `+err.Error()+`"}}`, http.StatusBadGateway)
+		return
+	}
+
+	var thinkBuf, textBuf strings.Builder
+	var msgID string
+	for _, f := range frames {
+		var ev kimiEvent
+		if json.Unmarshal(f.Data, &ev) != nil {
+			continue
+		}
+		if ev.Message != nil && ev.Message.Role == "assistant" {
+			msgID = ev.Message.ID
+		}
+		if ev.Block == nil {
+			continue
+		}
+		switch ev.Mask {
+		case "block.think", "block.think.content":
+			if ev.Block.Think != nil {
+				thinkBuf.WriteString(ev.Block.Think.Content)
+			}
+		case "block.text", "block.text.content":
+			if ev.Block.Text != nil {
+				textBuf.WriteString(ev.Block.Text.Content)
+			}
+		}
+	}
+
+	clean, toolCalls := splitSentinels(textBuf.String())
+	finish := "stop"
+	if len(toolCalls) > 0 {
+		finish = "tool_calls"
+	}
+
+	logInfo("GENERATED for %s: text_len=%d tools=%d think_len=%d", req.Model, len(clean), len(toolCalls), thinkBuf.Len())
+	_ = os.WriteFile("/tmp/kimi-last-raw.txt", []byte(textBuf.String()), 0o644)
 
 	msg := map[string]any{
 		"role":              "assistant",
