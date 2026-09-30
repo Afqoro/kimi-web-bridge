@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -191,9 +192,7 @@ func toolSeedPrompt(msgs []struct {
 		c := flattenContent(m.Content)
 		switch m.Role {
 		case "system":
-			if !haveTools { // bridge brief already written
-				sb.WriteString("[SYSTEM]\n" + c + "\n\n")
-			}
+			sb.WriteString("[SYSTEM]\n" + c + "\n\n")
 		case "user":
 			sb.WriteString("[USER]\n" + c + "\n\n")
 		case "assistant":
@@ -251,6 +250,9 @@ func buildKimiChatMulti(msgs []struct {
 	ToolCallID string          `json:"tool_call_id"`
 }, model string, tools json.RawMessage) (string, map[string]any) {
 	prompt := toolSeedPrompt(msgs, tools)
+	if os.Getenv("KIMI_WEB_DEBUG") != "" {
+		_ = os.WriteFile("/tmp/kimi-last-prompt.txt", []byte(prompt), 0o600)
+	}
 	return prompt, buildKimiChat(prompt, model)
 }
 
