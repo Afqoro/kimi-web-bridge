@@ -227,13 +227,20 @@ func toolSeedPrompt(msgs []struct {
 
 // kimiChatRequest is the inner connect JSON payload
 func buildKimiChat(text, model string) map[string]any {
+	scenario := "SCENARIO_CHAT"
+	kimiPlusID := ""
+	if strings.HasPrefix(model, "k3") {
+		scenario = "SCENARIO_OK_COMPUTER"
+		kimiPlusID = "ok-computer"
+	}
+
 	return map[string]any{
-		"scenario": "SCENARIO_CHAT",
+		"scenario": scenario,
 		"tools":    []any{},
 		"message": map[string]any{
 			"role":     "user",
 			"blocks":   []any{map[string]any{"message_id": "", "text": map[string]any{"content": text}}},
-			"scenario": "SCENARIO_CHAT",
+			"scenario": scenario,
 			"is_goal":  false,
 		},
 		"options": map[string]any{
@@ -242,7 +249,8 @@ func buildKimiChat(text, model string) map[string]any {
 			"reasoning_effort": "REASONING_EFFORT_LOW",
 			"model":            model,
 		},
-		"project_id": "",
+		"project_id":   "",
+		"kimi_plus_id": kimiPlusID,
 	}
 }
 
@@ -447,6 +455,61 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	finish := "stop"
 	if len(toolCalls) > 0 {
 		finish = "tool_calls"
+	}
+
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		flusher, ok := w.(http.Flusher)
+		sendChunk := func(delta map[string]any, finishReason *string) {
+			chunk := map[string]any{
+				"id":      "chatcmpl-kimiweb-" + msgID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   req.Model,
+				"choices": []any{map[string]any{
+					"index":         0,
+					"delta":         delta,
+					"finish_reason": finishReason,
+				}},
+			}
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			if ok {
+				flusher.Flush()
+			}
+		}
+
+		// 1. Initial role
+		sendChunk(map[string]any{"role": "assistant"}, nil)
+
+		// 2. Reasoning (if any)
+		if think := thinkBuf.String(); think != "" {
+			sendChunk(map[string]any{"reasoning_content": think}, nil)
+		}
+
+		// 3. Content (if any)
+		if clean != "" {
+			sendChunk(map[string]any{"content": clean}, nil)
+		}
+
+		// 4. Tool calls (if any)
+		if len(toolCalls) > 0 {
+			sendChunk(map[string]any{"tool_calls": toolCalls}, nil)
+		}
+
+		// 5. Final finish reason
+		sendChunk(map[string]any{}, &finish)
+
+		// 6. DONE sentinel
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		if ok {
+			flusher.Flush()
+		}
+		return
 	}
 
 	msg := map[string]any{
