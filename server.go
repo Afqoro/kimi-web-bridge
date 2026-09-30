@@ -361,6 +361,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
 		return
 	}
+	_ = os.WriteFile("/tmp/kimi-last-request.json", body, 0o644)
 	tok, ok := s.tok.Get()
 	if !ok {
 		http.Error(w, `{"error":{"message":"access token expired — refresh browser session (curl scripts/refresh.sh)","type":"auth_error"}}`, http.StatusServiceUnavailable)
@@ -456,6 +457,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if len(toolCalls) > 0 {
 		finish = "tool_calls"
 	}
+
+	logInfo("GENERATED for %s: text_len=%d tools=%d think_len=%d", req.Model, len(clean), len(toolCalls), thinkBuf.Len())
+	_ = os.WriteFile("/tmp/kimi-last-raw.txt", []byte(textBuf.String()), 0o644)
 
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
