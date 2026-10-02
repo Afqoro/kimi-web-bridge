@@ -16,9 +16,9 @@ import (
 )
 
 type Server struct {
-	cfg Config
-	tok *TokenStore
-	sync.Mutex
+	cfg    Config
+	tok    *TokenStore
+	chatMu sync.Mutex
 }
 
 func (s *Server) authWrap(next http.HandlerFunc) http.HandlerFunc {
@@ -419,6 +419,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	env[0] = 0x00
 	binary.BigEndian.PutUint32(env[1:5], uint32(len(innerB)))
 	copy(env[5:], innerB)
+
+	// Serialize upstream calls: kimi.ai rejects concurrent chats per account
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
 
 	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
 		s.cfg.Upstream+"/apiv2/kimi.gateway.chat.v1.ChatService/Chat", bytes.NewReader(env))
