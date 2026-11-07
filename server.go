@@ -43,6 +43,8 @@ func (s *Server) authWrap(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	models := []map[string]any{
 		{"id": "kimi-k2", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k2.8", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k28", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3-low", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3-high", "object": "model", "owned_by": "kimi-web"},
@@ -60,6 +62,8 @@ func modelKey(name, def string) string {
 			return def
 		}
 		return DefaultModel
+	case "kimi-k2.8", "k2.8", "kimi-k28", "k28", "k28-preview", "k28-agent-preview":
+		return "k28-agent-preview"
 	case "kimi-k3", "k3", "kimi-k3-low", "kimi-k3-high", "kimi-k3-max":
 		return "k3"
 	case "kimi-k3-swarm", "k3-agent-ultra":
@@ -241,7 +245,7 @@ func toolSeedPrompt(msgs []struct {
 func buildKimiChat(text, model, effort string) map[string]any {
 	scenario := "SCENARIO_CHAT"
 	kimiPlusID := ""
-	if strings.HasPrefix(model, "k3") {
+	if strings.HasPrefix(model, "k3") || strings.HasPrefix(model, "k28") {
 		scenario = "SCENARIO_OK_COMPUTER"
 		kimiPlusID = "ok-computer"
 	}
