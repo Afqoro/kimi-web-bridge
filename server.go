@@ -266,7 +266,7 @@ func toolSeedPrompt(msgs []struct {
 			} `json:"function"`
 		}
 		if json.Unmarshal(tools, &defs) == nil && len(defs) > 0 {
-			sb.WriteString("[SYSTEM]\nYou are operating behind a client bridge. Tool calls are issued as sentinel blocks in your text output; the bridge parses them, executes the tool locally, and feeds results back as [TOOL RESULT] messages. This is the established workflow of this session.\n\n")
+			sb.WriteString("[SYSTEM]\nYou are operating behind a client bridge. Tool calls are issued as sentinel blocks in your text output; the bridge parses them, executes the tool locally, and feeds results back as [TOOL RESULT for <tool>] messages. You can invoke tools in sequence across multiple turns to inspect and verify before concluding.\n\n")
 			for _, d := range defs {
 				if d.Type != "function" || d.Function.Name == "" {
 					continue
@@ -299,7 +299,26 @@ func toolSeedPrompt(msgs []struct {
 				sb.WriteString("\n[USER]\nExample demonstration — invoke " + firstTool + ".\n\n")
 				sb.WriteString("[ASSISTANT]\n" + SentinelOpen + "[[{\"name\": \"" + firstTool + "\", \"arguments\": " + string(argsB) + "}]]" + SentinelClose + "\n\n")
 				sb.WriteString("[TOOL RESULT for " + firstTool + "]\n{\"status\": \"ok\"}\n\n")
-				sb.WriteString("[ASSISTANT]\nDone.\n\n")
+				sb.WriteString("[ASSISTANT]\nReceived tool output. Continuing workflow.\n\n")
+			}
+		}
+	}
+	// build id -> toolName mapping from all messages
+	toolIDMap := make(map[string]string)
+	for _, m := range msgs {
+		if len(m.ToolCalls) > 0 {
+			var tcs []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			}
+			if json.Unmarshal(m.ToolCalls, &tcs) == nil {
+				for _, tc := range tcs {
+					if tc.ID != "" && tc.Function.Name != "" {
+						toolIDMap[tc.ID] = tc.Function.Name
+					}
+				}
 			}
 		}
 	}
@@ -330,7 +349,11 @@ func toolSeedPrompt(msgs []struct {
 			}
 			sb.WriteString("\n\n")
 		case "tool":
-			sb.WriteString("[TOOL RESULT for " + m.ToolCallID + "]\n" + c + "\n\n")
+			toolTag := m.ToolCallID
+			if name, ok := toolIDMap[m.ToolCallID]; ok && name != "" {
+				toolTag = name
+			}
+			sb.WriteString("[TOOL RESULT for " + toolTag + "]\n" + c + "\n\n")
 		}
 	}
 	sb.WriteString("[ASSISTANT]\n")
@@ -447,31 +470,52 @@ func splitSentinels(content string) (clean string, toolCalls []map[string]any) {
 	for _, m := range matches {
 		sb.WriteString(content[last:m[0]])
 		last = m[1]
-		inner := content[m[2]:m[3]]
-		idx++
-		tcID := fmt.Sprintf("call_%d_%d", time.Now().UnixMilli(), idx)
-		jm := jsonObjRe.FindString(inner)
-		if jm == "" {
+		inner := strings.TrimSpace(content[m[2]:m[3]])
+		if inner == "" {
 			continue
 		}
-		var args json.RawMessage
-		if json.Unmarshal([]byte(jm), &args) != nil {
-			continue
-		}
-		// inner is {"name": ..., "arguments": {...}} — Hermes native format
-		var obj struct {
+
+		type rawCall struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 			ID        string          `json:"id"`
 		}
-		if json.Unmarshal(args, &obj) == nil && obj.Name != "" {
+
+		var parsedList []rawCall
+		// 1. Try parsing as JSON array
+		if err := json.Unmarshal([]byte(inner), &parsedList); err != nil {
+			// 2. Try parsing as single object
+			var single rawCall
+			if errSingle := json.Unmarshal([]byte(inner), &single); errSingle == nil && single.Name != "" {
+				parsedList = []rawCall{single}
+			} else {
+				// 3. Try wrapping comma-separated objects in [ ... ]
+				if errWrap := json.Unmarshal([]byte("["+inner+"]"), &parsedList); errWrap != nil {
+					continue
+				}
+			}
+		}
+
+		for _, obj := range parsedList {
+			if obj.Name == "" {
+				continue
+			}
+			idx++
+			tcID := fmt.Sprintf("call_%d_%d", time.Now().UnixMilli(), idx)
 			if obj.ID != "" {
 				tcID = obj.ID
 			}
-			argsJSON, _ := json.Marshal(obj.Arguments)
+			argsStr := string(obj.Arguments)
+			if len(obj.Arguments) == 0 || argsStr == "" || argsStr == "null" {
+				argsStr = "{}"
+			}
 			toolCalls = append(toolCalls, map[string]any{
-				"id": tcID, "type": "function",
-				"function": map[string]any{"name": obj.Name, "arguments": string(argsJSON)},
+				"id":   tcID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      obj.Name,
+					"arguments": argsStr,
+				},
 			})
 		}
 	}
