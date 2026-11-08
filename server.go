@@ -44,14 +44,110 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	models := []map[string]any{
 		{"id": "kimi-k2", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k2.8", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k2.8-low", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k2.8-high", "object": "model", "owned_by": "kimi-web"},
+		{"id": "kimi-k2.8-max", "object": "model", "owned_by": "kimi-web"},
+		{"id": "low-kimi-k2.8", "object": "model", "owned_by": "kimi-web"},
+		{"id": "high-kimi-k2.8", "object": "model", "owned_by": "kimi-web"},
+		{"id": "max-kimi-k2.8", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k28", "object": "model", "owned_by": "kimi-web"},
+		{"id": "low-kimi-k28", "object": "model", "owned_by": "kimi-web"},
+		{"id": "high-kimi-k28", "object": "model", "owned_by": "kimi-web"},
+		{"id": "max-kimi-k28", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3-low", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3-high", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3-max", "object": "model", "owned_by": "kimi-web"},
+		{"id": "low-kimi-k3", "object": "model", "owned_by": "kimi-web"},
+		{"id": "high-kimi-k3", "object": "model", "owned_by": "kimi-web"},
+		{"id": "max-kimi-k3", "object": "model", "owned_by": "kimi-web"},
 		{"id": "kimi-k3-swarm", "object": "model", "owned_by": "kimi-web"},
 	}
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
+}
+
+// parseModelAndEffort extracts reasoning effort from prefix/suffix or explicit param
+func parseModelAndEffort(rawModel, explicitEffort string) (cleanModel, effort string) {
+	clean := strings.TrimSpace(rawModel)
+	effort = strings.TrimSpace(explicitEffort)
+
+	// Prefix check (e.g., high-kimi-k2.8, max-kimi-k3)
+	if strings.HasPrefix(clean, "high-") {
+		clean = strings.TrimPrefix(clean, "high-")
+		if effort == "" {
+			effort = "high"
+		}
+	} else if strings.HasPrefix(clean, "medium-") {
+		clean = strings.TrimPrefix(clean, "medium-")
+		if effort == "" {
+			effort = "medium"
+		}
+	} else if strings.HasPrefix(clean, "max-") {
+		clean = strings.TrimPrefix(clean, "max-")
+		if effort == "" {
+			effort = "max"
+		}
+	} else if strings.HasPrefix(clean, "ultra-") {
+		clean = strings.TrimPrefix(clean, "ultra-")
+		if effort == "" {
+			effort = "max"
+		}
+	} else if strings.HasPrefix(clean, "low-") {
+		clean = strings.TrimPrefix(clean, "low-")
+		if effort == "" {
+			effort = "low"
+		}
+	} else if strings.HasPrefix(clean, "standard-") {
+		clean = strings.TrimPrefix(clean, "standard-")
+		if effort == "" {
+			effort = "low"
+		}
+	} else if strings.HasPrefix(clean, "none-") {
+		clean = strings.TrimPrefix(clean, "none-")
+		if effort == "" {
+			effort = "none"
+		}
+	}
+
+	// Suffix check (e.g., kimi-k2.8-high, kimi-k3-max)
+	if strings.HasSuffix(clean, "-high") {
+		clean = strings.TrimSuffix(clean, "-high")
+		if effort == "" {
+			effort = "high"
+		}
+	} else if strings.HasSuffix(clean, "-medium") {
+		clean = strings.TrimSuffix(clean, "-medium")
+		if effort == "" {
+			effort = "medium"
+		}
+	} else if strings.HasSuffix(clean, "-max") {
+		clean = strings.TrimSuffix(clean, "-max")
+		if effort == "" {
+			effort = "max"
+		}
+	} else if strings.HasSuffix(clean, "-ultra") {
+		clean = strings.TrimSuffix(clean, "-ultra")
+		if effort == "" {
+			effort = "max"
+		}
+	} else if strings.HasSuffix(clean, "-low") {
+		clean = strings.TrimSuffix(clean, "-low")
+		if effort == "" {
+			effort = "low"
+		}
+	} else if strings.HasSuffix(clean, "-standard") {
+		clean = strings.TrimSuffix(clean, "-standard")
+		if effort == "" {
+			effort = "low"
+		}
+	} else if strings.HasSuffix(clean, "-none") {
+		clean = strings.TrimSuffix(clean, "-none")
+		if effort == "" {
+			effort = "none"
+		}
+	}
+
+	return clean, effort
 }
 
 // modelKey maps OpenAI-style model names to internal Kimi keys
@@ -64,7 +160,7 @@ func modelKey(name, def string) string {
 		return DefaultModel
 	case "kimi-k2.8", "k2.8", "kimi-k28", "k28", "k28-preview", "k28-agent-preview":
 		return "k28-agent-preview"
-	case "kimi-k3", "k3", "kimi-k3-low", "kimi-k3-high", "kimi-k3-max":
+	case "kimi-k3", "k3":
 		return "k3"
 	case "kimi-k3-swarm", "k3-agent-ultra":
 		return "k3-agent-ultra"
@@ -407,16 +503,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	effort := req.ReasoningEffort
-	if strings.HasSuffix(req.Model, "-high") {
-		effort = "high"
-	} else if strings.HasSuffix(req.Model, "-max") || strings.HasSuffix(req.Model, "-ultra") {
-		effort = "max"
-	} else if strings.HasSuffix(req.Model, "-low") {
-		effort = "low"
-	}
+	cleanModel, effort := parseModelAndEffort(req.Model, req.ReasoningEffort)
 
-	prompt, inner := buildKimiChatMulti(req.Messages, modelKey(req.Model, s.cfg.DefaultModel), effort, req.Tools)
+	prompt, inner := buildKimiChatMulti(req.Messages, modelKey(cleanModel, s.cfg.DefaultModel), effort, req.Tools)
 	_ = prompt
 	innerB, _ := json.Marshal(inner)
 	env := make([]byte, 5+len(innerB))
