@@ -699,6 +699,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if json.Unmarshal(f.Data, &ev) != nil {
 			continue
 		}
+		if ev.Error != nil {
+			errMsg := ev.Error.Code
+			if len(ev.Error.Details) > 0 && ev.Error.Details[0].Debug.LocalizedMessage.Message != "" {
+				errMsg = ev.Error.Details[0].Debug.LocalizedMessage.Message
+			}
+			logInfo("UPSTREAM ERROR EVENT: %s", errMsg)
+		}
 		if ev.Message != nil && ev.Message.Role == "assistant" {
 			msgID = ev.Message.ID
 		}
